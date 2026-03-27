@@ -42,7 +42,9 @@ ollama pull mxbai-embed-large
 
 3. Installation des dépendances
 
+```bash
 pip install -r requirements.txt
+```
 
 ## Utilisation
 Lancer l'application :
@@ -54,3 +56,5 @@ streamlit run 5_app_visuelle.py
 Ajouter des documents : Utilisez la barre latérale pour uploader vos PDF.
 
 Discuter : Posez vos questions. L'IA utilisera vos documents pour vous répondre en priorité.
+
+![interface](interface.png)
