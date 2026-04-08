@@ -3,50 +3,60 @@ from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 import os
 
 # --- CONFIGURATION DE LA PAGE ---
-st.set_page_config(page_title="Mon IA Perso", page_icon="🤖")
+st.set_page_config(page_title="Mon IA Perso", page_icon="🤖", layout="wide")
 st.title("🤖 Assistant Personnel Local")
 
 # --- INITIALISATION DES MOTEURS ---
-@st.cache_resource 
+@st.cache_resource
 def init_models():
-    # On initialise les outils une seule fois
-    embeddings = OllamaEmbeddings(model="mxbai-embed-large")
-    llm = ChatOllama(model="llama3", temperature=0.3)
-    # On charge la base existante sur le disque
+    llm_model   = os.getenv("LLM_MODEL", "mistral")
+    embed_model = os.getenv("EMBED_MODEL", "mxbai-embed-large")
+    embeddings = OllamaEmbeddings(model=embed_model)
+    llm = ChatOllama(model=llm_model, temperature=0.3)
     db = Chroma(persist_directory="./ma_base", embedding_function=embeddings)
     return llm, embeddings, db
 
 llm, embeddings, db = init_models()
 
-# --- BARRE LATÉRALE (SIDEBAR) ---
+# --- BARRE LATÉRALE ---
 with st.sidebar:
     st.header("📁 Administration")
-    
-    # Section Upload
+
     uploaded_file = st.file_uploader("Ajouter un PDF à la base", type="pdf")
-    
+
     if uploaded_file is not None:
         if st.button("🚀 Indexer définitivement"):
             with st.status("Analyse et stockage..."):
-                # 1. Sauvegarde physique dans le dossier /data
-                if not os.path.exists("./data"): os.makedirs("./data")
+                if not os.path.exists("./data"):
+                    os.makedirs("./data")
                 path = os.path.join("./data", uploaded_file.name)
                 with open(path, "wb") as f:
                     f.write(uploaded_file.getbuffer())
-                
-                # 2. Découpage en petits morceaux (Chunks)
+
                 loader = PyPDFLoader(path)
-                text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=80)
+                text_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=800, chunk_overlap=80
+                )
                 chunks = text_splitter.split_documents(loader.load())
-                
-                # 3. Ajout à la base ChromaDB (Ecriture sur disque)
                 db.add_documents(chunks)
-                
+
+                # FIX : on force le rechargement de la ressource cachée
+                init_models.clear()
+
             st.success(f"'{uploaded_file.name}' ajouté à la base !")
-            st.info("L'IA peut maintenant répondre sur ce document.")
+
+    st.write("---")
+
+    # Affichage du nombre de documents indexés
+    try:
+        count = db._collection.count()
+        st.metric("Chunks indexés", count)
+    except Exception:
+        pass
 
     st.write("---")
     if st.button("🗑️ Effacer la conversation"):
@@ -55,7 +65,7 @@ with st.sidebar:
 
 st.markdown("---")
 
-# --- GESTION DE LA MÉMOIRE (SESSION) ---
+# --- MÉMOIRE DE SESSION ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -66,26 +76,61 @@ for message in st.session_state.messages:
 
 # --- ZONE DE CHAT ---
 if prompt := st.chat_input("Posez-moi une question..."):
-    # 1. Message Utilisateur
+
+    # 1. Affichage et sauvegarde du message utilisateur
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # 2. Réponse de l'Assistant
+    # 2. Réponse de l'assistant
     with st.chat_message("assistant"):
-        # On cherche dans la base (permanente)
-        # On limite k=3 pour éviter de saturer la VRAM du GPU
+
+        # --- Recherche RAG dans la base ---
         docs = db.similarity_search(prompt, k=3)
         context = "\n\n".join([d.page_content for d in docs])
-        
-        full_prompt = f"""Tu es un assistant personnel. 
-        Utilise ce contexte pour répondre : {context}
-        
-        Si l'info n'est pas là, utilise tes connaissances générales.
-        Question : {prompt}"""
-        
-        response = llm.invoke(full_prompt)
-        st.markdown(response.content)
-        
-    # 3. Sauvegarde
-    st.session_state.messages.append({"role": "assistant", "content": response.content})
+
+        # --- Construction des messages avec historique ---
+        # Le LLM reçoit maintenant TOUT l'historique, pas juste la dernière question
+        system_message = SystemMessage(content=f"""Tu es un assistant personnel intelligent et précis.
+Utilise le contexte documentaire ci-dessous pour répondre aux questions.
+Si la réponse ne se trouve pas dans le contexte, utilise tes connaissances générales en le signalant clairement.
+Réponds toujours en français, de façon structurée et concise.
+
+--- CONTEXTE DOCUMENTAIRE ---
+{context}
+--- FIN DU CONTEXTE ---""")
+
+        # Reconstitution de l'historique au format LangChain
+        history = []
+        for msg in st.session_state.messages[:-1]:  # Tout sauf le dernier (déjà ajouté)
+            if msg["role"] == "user":
+                history.append(HumanMessage(content=msg["content"]))
+            elif msg["role"] == "assistant":
+                history.append(AIMessage(content=msg["content"]))
+
+        # Message actuel
+        current_message = HumanMessage(content=prompt)
+
+        messages_to_send = [system_message] + history + [current_message]
+
+        # --- Streaming de la réponse ---
+        response_placeholder = st.empty()
+        full_response = ""
+
+        for chunk in llm.stream(messages_to_send):
+            full_response += chunk.content
+            response_placeholder.markdown(full_response + "▌")  # curseur animé
+
+        response_placeholder.markdown(full_response)  # Affichage final propre
+
+        # --- Affichage des sources utilisées ---
+        if docs:
+            with st.expander("📚 Sources utilisées", expanded=False):
+                for i, doc in enumerate(docs):
+                    source = doc.metadata.get("source", "Document inconnu")
+                    page = doc.metadata.get("page", "?")
+                    st.caption(f"**[{i+1}] {os.path.basename(source)} — page {page}**")
+                    st.text(doc.page_content[:300] + "...")
+
+    # 3. Sauvegarde de la réponse
+    st.session_state.messages.append({"role": "assistant", "content": full_response})
